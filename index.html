@@ -1,1 +1,251 @@
-<h1>Hello World</h1>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL Multi-Index Size Estimator</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .form-container {
+            width: 400px;
+            margin: 0 auto;
+        }
+        label, textarea, input, select {
+            display: block;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 20px;
+            font-size: 1.2em;
+            color: #333;
+        }
+        textarea {
+            height: 100px;
+        }
+        .add-index-btn {
+            background-color: #007bff;
+            margin-bottom: 10px;
+        }
+        .index-container {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .index-usage {
+            font-style: italic;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+
+<div class="form-container">
+    <h2>PostgreSQL Multi-Index Size Estimator</h2>
+
+    <!-- Form for input -->
+    <form id="indexForm">
+        <label for="tableSchema">Table Schema (CREATE TABLE statement):</label>
+        <textarea id="tableSchema" required placeholder="Enter PostgreSQL table schema (CREATE TABLE...)"></textarea>
+
+        <div id="indexInputs">
+            <div class="index-container">
+                <label for="indexDefinition">Index Definition (CREATE INDEX statement):</label>
+                <textarea class="indexDefinition" required placeholder="Enter PostgreSQL index definition (CREATE INDEX...)" oninput="updateIndexUsage(this)"></textarea>
+                <div class="index-usage">Index Type: <span class="usage"></span></div>
+            </div>
+        </div>
+
+        <button type="button" class="add-index-btn" onclick="addIndex()">Add Another Index</button>
+
+        <label for="numRows">Number of Rows (in millions):</label>
+        <input type="number" id="numRows" required placeholder="Enter the number of rows in millions" step="0.01" min="0">
+
+        <button type="submit">Estimate Index Sizes</button>
+    </form>
+
+    <!-- Result container -->
+    <div class="result" id="result"></div>
+</div>
+
+<script>
+    // Function to add another index input dynamically
+    function addIndex() {
+        const indexInputsDiv = document.getElementById('indexInputs');
+        const newIndexDiv = document.createElement('div');
+        newIndexDiv.classList.add('index-container');
+        newIndexDiv.innerHTML = `
+            <label for="indexDefinition">Index Definition (CREATE INDEX statement):</label>
+            <textarea class="indexDefinition" required placeholder="Enter PostgreSQL index definition (CREATE INDEX...)" oninput="updateIndexUsage(this)"></textarea>
+            <div class="index-usage">Index Type: <span class="usage"></span></div>
+        `;
+        indexInputsDiv.appendChild(newIndexDiv);
+    }
+
+    // Function to deduce index type from the CREATE INDEX statement
+    function deduceIndexType(indexDefinition) {
+        if (indexDefinition.toUpperCase().includes('USING GIN')) {
+            return 'GIN';
+        } else if (indexDefinition.toUpperCase().includes('USING GIST')) {
+            return 'GiST';
+        } else {
+            return 'B-tree'; // Default to B-tree if no specific type is mentioned
+        }
+    }
+
+    // Function to update the index usage dynamically as the user types
+    function updateIndexUsage(textarea) {
+        const indexDefinition = textarea.value;
+        const indexContainer = textarea.parentElement;
+        const usageSpan = indexContainer.querySelector('.usage');
+        const indexType = deduceIndexType(indexDefinition);
+        usageSpan.textContent = indexType;
+    }
+
+    // Function to parse column types from the CREATE TABLE statement
+    function parseTableSchema(tableSchema) {
+        const columnTypes = {};
+        const lines = tableSchema.split(/\r?\n/); // Split schema into lines
+        const columnRegex = /^\s*(\w+)\s+(\w+)/; // Regex to match "column_name column_type"
+
+        lines.forEach(line => {
+            const match = line.trim().match(columnRegex);
+            if (match) {
+                const columnName = match[1];
+                const columnType = match[2].toLowerCase(); // Store column types in lowercase
+                columnTypes[columnName] = columnType;
+            }
+        });
+
+        return columnTypes;
+    }
+
+    // Function to extract column names from the index definition
+    function parseIndexDefinition(indexDefinition) {
+        const columns = [];
+        const indexRegex = /\(([^)]+)\)/; // Regex to capture content inside parentheses
+        const match = indexDefinition.match(indexRegex);
+        if (match) {
+            const columnList = match[1].split(','); // Split column list by commas
+            columnList.forEach(col => columns.push(col.trim()));
+        }
+        return columns;
+    }
+
+    // Function to estimate the size of a single index
+    function estimateSingleIndexSize(indexDefinition, columnTypes, numRows) {
+        // Parse the index definition to get the indexed columns
+        const indexColumns = parseIndexDefinition(indexDefinition);
+
+        // Deduce index type from the index definition
+        const indexType = deduceIndexType(indexDefinition);
+
+        // Calculate total column size based on indexed columns
+        let totalColumnSize = 0;
+
+        indexColumns.forEach(column => {
+            const columnType = columnTypes[column.toLowerCase()];
+            if (columnType) {
+                switch (columnType) {
+                    case 'integer':
+                        totalColumnSize += 4; // 4 bytes for INTEGER
+                        break;
+                    case 'bigint':
+                        totalColumnSize += 8; // 8 bytes for BIGINT
+                        break;
+                    case 'varchar':
+                    case 'text':
+                        totalColumnSize += 200; // Assume average 200 bytes for TEXT and VARCHAR
+                        break;
+                    default:
+                        totalColumnSize += 100; // Default to 100 bytes for unknown types
+                }
+            } else {
+                alert(`Column '${column}' not found in the schema!`);
+                return;
+            }
+        });
+
+        // Base overhead for the index type (in bytes)
+        let indexOverhead;
+        switch (indexType) {
+            case 'B-tree':
+                indexOverhead = 32; // Rough overhead for B-tree per row
+                break;
+            case 'GIN':
+                indexOverhead = 64; // GIN index overhead tends to be larger
+                break;
+            case 'GiST':
+                indexOverhead = 40; // GiST index overhead
+                break;
+            default:
+                indexOverhead = 32; // Default to B-tree
+        }
+
+        // Estimate index size: numRows * (totalColumnSize + indexOverhead)
+        const estimatedSize = numRows * (totalColumnSize + indexOverhead);
+
+        // Convert to a human-readable format (bytes -> MB)
+        return (estimatedSize / (1024 * 1024)).toFixed(2); // Return size in MB
+    }
+
+    // Function to estimate the size of all indexes
+    function estimateIndexSizes(event) {
+        event.preventDefault(); // Prevent form submission
+
+        // Get form inputs
+        const tableSchema = document.getElementById("tableSchema").value;
+        const numRowsMillions = parseFloat(document.getElementById("numRows").value); // Get rows in millions
+
+        // Convert millions to actual number of rows
+        const numRows = numRowsMillions * 1e6; // Convert to actual number of rows
+
+        // Check for valid inputs
+        if (isNaN(numRowsMillions) || numRowsMillions <= 0) {
+            alert("Please enter a valid number of rows in millions.");
+            return;
+        }
+
+        // Parse the table schema to get column types
+        const columnTypes = parseTableSchema(tableSchema);
+
+        // Get all index definitions
+        const indexDefinitions = document.querySelectorAll(".indexDefinition");
+
+        // Estimate index sizes and display results
+        let totalSizeMB = 0;
+        let resultText = "Estimated Index Sizes:\n";
+
+        indexDefinitions.forEach((indexDef, i) => {
+            const indexSizeMB = estimateSingleIndexSize(indexDef.value, columnTypes, numRows);
+            resultText += `Index ${i + 1}: ${indexSizeMB} MB\n`;
+            totalSizeMB += parseFloat(indexSizeMB);
+        });
+
+        resultText += `\nTotal Estimated Index Size: ${totalSizeMB.toFixed(2)} MB`;
+
+        // Display the result
+        const resultElement = document.getElementById("result");
+        resultElement.textContent = resultText;
+    }
+
+    // Attach the submit event handler
+    document.getElementById("indexForm").addEventListener("submit", estimateIndexSizes);
+</script>
+
+</body>
+</html>
